@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import contextvars as _ctxvars
 from pathlib import Path
@@ -153,6 +154,100 @@ SKILLS_DIR = HERMES_HOME / "skills"
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+
+
+def _shared_assets_auto_import_enabled() -> bool:
+    """Return whether successful skill writes should trigger shared-assets import."""
+    env_value = os.getenv("HERMES_SHARED_ASSETS_AUTO_IMPORT")
+    if env_value is not None:
+        return is_truthy_value(env_value, default=True)
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        return is_truthy_value(
+            cfg_get(cfg, "skills", "shared_assets_auto_import"),
+            default=True,
+        )
+    except Exception:
+        return True
+
+
+def _resolve_shared_assets_import_hook() -> Optional[Path]:
+    """Resolve the optional post-skill-write shared-assets import hook."""
+    raw = os.getenv("HERMES_SHARED_ASSETS_IMPORT_HOOK")
+
+    if not raw:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            configured = cfg_get(cfg, "skills", "shared_assets_import_hook")
+            raw = str(configured).strip() if configured else ""
+        except Exception:
+            raw = ""
+
+    candidates: List[Path] = []
+    if raw:
+        candidates.append(Path(os.path.expandvars(raw)).expanduser())
+    candidates.append(
+        Path.home()
+        / "AI"
+        / "Hermes"
+        / "Personal-Hermes-Shared-Assets"
+        / "scripts"
+        / "import-and-push-local-hermes-assets.sh"
+    )
+
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _trigger_shared_assets_import(action: str, name: str) -> None:
+    """Best-effort async import/push after a successful skill mutation."""
+    if action not in {"create", "edit", "patch", "delete", "write_file", "remove_file"}:
+        return
+    if not _shared_assets_auto_import_enabled():
+        return
+
+    hook = _resolve_shared_assets_import_hook()
+    if hook is None:
+        return
+
+    env = os.environ.copy()
+    env.setdefault("HERMES_HOME", str(HERMES_HOME))
+    env.setdefault("HERMES_ASSETS_DEVICE_ID", os.getenv("HERMES_DEVICE_ID", "mbp"))
+    env["HERMES_ASSETS_TRIGGER"] = f"skill_manage:{action}:{name}"
+
+    try:
+        subprocess.Popen(
+            [str(hook)],
+            cwd=str(hook.parent.parent),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=(os.name != "nt"),
+        )
+        logger.info(
+            "Triggered shared-assets import hook after skill_manage action=%s name=%s",
+            action,
+            name,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to trigger shared-assets import hook after skill_manage action=%s name=%s",
+            action,
+            name,
+            exc_info=True,
+        )
 
 
 def _containing_skills_root(skill_path: Path) -> Path:
@@ -1397,6 +1492,7 @@ def skill_manage(
                     forget(name)
         except Exception:
             pass
+        _trigger_shared_assets_import(action, name)
 
     return json.dumps(result, ensure_ascii=False)
 

@@ -8,7 +8,10 @@ tool registration or provider resolution.
 import logging
 import os
 import re
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -217,6 +220,10 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
 _KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
 
 _ENV_DETECT_CACHE: Dict[str, bool] = {}
+_EXTERNAL_PULL_SETTINGS_CACHE: Dict[Tuple[str, int], Tuple[bool, int]] = {}
+_EXTERNAL_PULL_LAST: Dict[Path, float] = {}
+_EXTERNAL_PULL_INFLIGHT: Set[Path] = set()
+_EXTERNAL_PULL_LOCK = threading.Lock()
 
 
 def _detect_environment(env: str) -> bool:
@@ -440,6 +447,8 @@ def get_external_skills_dirs() -> List[Path]:
     if cache_key is not None:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
         if cached is not None:
+            settings = _EXTERNAL_PULL_SETTINGS_CACHE.get(cache_key, (False, 300))
+            _maybe_auto_pull_external_skill_dirs(cached, *settings)
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
@@ -456,6 +465,7 @@ def get_external_skills_dirs() -> List[Path]:
         result: List[Path] = []
         if cache_key is not None:
             _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+            _EXTERNAL_PULL_SETTINGS_CACHE[cache_key] = (False, 300)
         return result
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
@@ -468,6 +478,18 @@ def get_external_skills_dirs() -> List[Path]:
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result = []
+    auto_pull_enabled = _coerce_bool(
+        os.getenv("HERMES_EXTERNAL_SKILLS_AUTO_PULL")
+        if os.getenv("HERMES_EXTERNAL_SKILLS_AUTO_PULL") is not None
+        else skills_cfg.get("external_dirs_auto_pull"),
+        default=False,
+    )
+    auto_pull_interval = _coerce_int(
+        os.getenv("HERMES_EXTERNAL_SKILLS_AUTO_PULL_INTERVAL")
+        or skills_cfg.get("external_dirs_auto_pull_interval_seconds"),
+        default=300,
+        minimum=30,
+    )
 
     for entry in raw_dirs:
         entry = str(entry).strip()
@@ -493,7 +515,103 @@ def get_external_skills_dirs() -> List[Path]:
 
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+        _EXTERNAL_PULL_SETTINGS_CACHE[cache_key] = (
+            auto_pull_enabled,
+            auto_pull_interval,
+        )
+    _maybe_auto_pull_external_skill_dirs(
+        result,
+        auto_pull_enabled,
+        auto_pull_interval,
+    )
     return result
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return default
+
+
+def _coerce_int(value: Any, *, default: int, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, minimum)
+
+
+def _find_git_worktree_root(path: Path) -> Optional[Path]:
+    """Return the containing Git worktree root for an external skills path."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+
+    for current in (resolved, *resolved.parents):
+        if (current / ".git").exists():
+            return current
+    return None
+
+
+def _maybe_auto_pull_external_skill_dirs(
+    dirs: List[Path],
+    enabled: bool,
+    interval_seconds: int,
+) -> None:
+    """Best-effort background `git pull --ff-only` for Git-backed skill dirs."""
+    if not enabled or not dirs:
+        return
+
+    now = time.monotonic()
+    roots: Set[Path] = set()
+    for external_dir in dirs:
+        root = _find_git_worktree_root(external_dir)
+        if root is not None:
+            roots.add(root)
+
+    for root in roots:
+        with _EXTERNAL_PULL_LOCK:
+            last = _EXTERNAL_PULL_LAST.get(root, 0.0)
+            if root in _EXTERNAL_PULL_INFLIGHT:
+                continue
+            if now - last < interval_seconds:
+                continue
+            _EXTERNAL_PULL_INFLIGHT.add(root)
+            _EXTERNAL_PULL_LAST[root] = now
+
+        thread = threading.Thread(
+            target=_pull_external_skill_worktree,
+            args=(root,),
+            name=f"external-skill-pull:{root.name}",
+            daemon=True,
+        )
+        thread.start()
+
+
+def _pull_external_skill_worktree(root: Path) -> None:
+    try:
+        subprocess.run(
+            ["git", "pull", "--ff-only", "--quiet"],
+            cwd=str(root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        logger.debug("External skill worktree auto-pull failed: %s", root, exc_info=True)
+    finally:
+        with _EXTERNAL_PULL_LOCK:
+            _EXTERNAL_PULL_INFLIGHT.discard(root)
 
 
 def get_all_skills_dirs() -> List[Path]:

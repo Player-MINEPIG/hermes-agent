@@ -2227,6 +2227,11 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Best-effort refresh for Git-backed external skill dirs.  When on,
+        # Hermes starts a throttled background `git pull --ff-only` for each
+        # external dir's containing worktree while resolving available skills.
+        "external_dirs_auto_pull": False,
+        "external_dirs_auto_pull_interval_seconds": 300,
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -2264,6 +2269,14 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # After a successful skill_manage write, best-effort trigger an external
+        # shared-assets import hook.  The hook is intentionally optional: if the
+        # configured/default script is missing, Hermes silently skips it.
+        "shared_assets_auto_import": True,
+        # Override path for the shared-assets import hook.  Empty means Hermes
+        # tries the per-user default:
+        # ~/AI/Hermes/Personal-Hermes-Shared-Assets/scripts/import-and-push-local-hermes-assets.sh
+        "shared_assets_import_hook": "",
     },
 
     # Curator — background skill maintenance.
