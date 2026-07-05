@@ -226,8 +226,12 @@ def _trigger_shared_assets_import(action: str, name: str) -> None:
     env["HERMES_ASSETS_TRIGGER"] = f"skill_manage:{action}:{name}"
 
     try:
+        if os.name == "nt":
+            cmd = ["bash", str(hook)]
+        else:
+            cmd = [str(hook)]
         subprocess.Popen(
-            [str(hook)],
+            cmd,
             cwd=str(hook.parent.parent),
             env=env,
             stdin=subprocess.DEVNULL,
