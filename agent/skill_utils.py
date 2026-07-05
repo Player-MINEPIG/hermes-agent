@@ -222,7 +222,6 @@ _KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
 _ENV_DETECT_CACHE: Dict[str, bool] = {}
 _EXTERNAL_PULL_SETTINGS_CACHE: Dict[Tuple[str, int], Tuple[bool, int]] = {}
 _EXTERNAL_PULL_LAST: Dict[Path, float] = {}
-_EXTERNAL_PULL_INFLIGHT: Set[Path] = set()
 _EXTERNAL_PULL_LOCK = threading.Lock()
 
 
@@ -448,9 +447,12 @@ def get_external_skills_dirs() -> List[Path]:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
         if cached is not None:
             settings = _EXTERNAL_PULL_SETTINGS_CACHE.get(cache_key, (False, 300))
-            _maybe_auto_pull_external_skill_dirs(cached, *settings)
-            # Return a copy so callers can't mutate the cached list.
-            return list(cached)
+            # Synchronous pull — excludes dirs whose git worktree fails.
+            filtered = _sync_pull_external_skill_dirs(cached, *settings)
+            # Update cache if the pull filtered anything out.
+            if len(filtered) != len(cached):
+                _EXTERNAL_DIRS_CACHE[cache_key] = list(filtered)
+            return list(filtered)
 
     parsed = _load_raw_config()
     if not parsed:
@@ -519,7 +521,7 @@ def get_external_skills_dirs() -> List[Path]:
             auto_pull_enabled,
             auto_pull_interval,
         )
-    _maybe_auto_pull_external_skill_dirs(
+    result = _sync_pull_external_skill_dirs(
         result,
         auto_pull_enabled,
         auto_pull_interval,
@@ -561,57 +563,81 @@ def _find_git_worktree_root(path: Path) -> Optional[Path]:
     return None
 
 
-def _maybe_auto_pull_external_skill_dirs(
+def _sync_pull_external_skill_dirs(
     dirs: List[Path],
     enabled: bool,
     interval_seconds: int,
-) -> None:
-    """Best-effort background `git pull --ff-only` for Git-backed skill dirs."""
+) -> List[Path]:
+    """Synchronous ``git pull --ff-only`` for Git-backed skill dirs.
+
+    Returns only directories whose git worktree pulled successfully.
+    On failure, logs a warning and excludes the failed worktree's dirs
+    so Hermes never loads potentially stale skills.
+    """
     if not enabled or not dirs:
-        return
+        return dirs
 
     now = time.monotonic()
-    roots: Set[Path] = set()
-    for external_dir in dirs:
-        root = _find_git_worktree_root(external_dir)
-        if root is not None:
-            roots.add(root)
 
-    for root in roots:
+    # Map each dir to its git worktree root.
+    dir_to_root: Dict[Path, Optional[Path]] = {}
+    for d in dirs:
+        root = _find_git_worktree_root(d)
+        if root is not None:
+            dir_to_root[d] = root
+
+    # Group dirs by git root.
+    root_dirs: Dict[Path, List[Path]] = {}
+    for d, root in dir_to_root.items():
+        root_dirs.setdefault(root, []).append(d)
+
+    failed_roots: Set[Path] = set()
+
+    for root, member_dirs in root_dirs.items():
         with _EXTERNAL_PULL_LOCK:
             last = _EXTERNAL_PULL_LAST.get(root, 0.0)
-            if root in _EXTERNAL_PULL_INFLIGHT:
-                continue
             if now - last < interval_seconds:
-                continue
-            _EXTERNAL_PULL_INFLIGHT.add(root)
+                continue  # Rate limited — pass through
             _EXTERNAL_PULL_LAST[root] = now
 
-        thread = threading.Thread(
-            target=_pull_external_skill_worktree,
-            args=(root,),
-            name=f"external-skill-pull:{root.name}",
-            daemon=True,
-        )
-        thread.start()
+        success, error = _pull_worktree_sync(root)
+        if not success:
+            logger.warning(
+                "External skill dir git pull FAILED for %s: %s. "
+                "Excluding %d dir(s) from external skills.",
+                root, error, len(member_dirs),
+            )
+            failed_roots.add(root)
+
+    if not failed_roots:
+        return dirs
+
+    # Exclude dirs whose git root failed to pull.
+    return [d for d in dirs if d not in dir_to_root or dir_to_root[d] not in failed_roots]
 
 
-def _pull_external_skill_worktree(root: Path) -> None:
+def _pull_worktree_sync(root: Path) -> Tuple[bool, str]:
+    """Synchronous ``git pull --ff-only``. Returns (success, error_message)."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "pull", "--ff-only", "--quiet"],
             cwd=str(root),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             timeout=30,
-            check=False,
         )
-    except Exception:
-        logger.debug("External skill worktree auto-pull failed: %s", root, exc_info=True)
-    finally:
-        with _EXTERNAL_PULL_LOCK:
-            _EXTERNAL_PULL_INFLIGHT.discard(root)
+        if result.returncode != 0:
+            return False, (
+                result.stderr or result.stdout or f"exit code {result.returncode}"
+            ).strip()
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "git pull timed out after 30s"
+    except FileNotFoundError:
+        return False, "git command not found"
+    except Exception as e:
+        return False, str(e)
 
 
 def get_all_skills_dirs() -> List[Path]:
