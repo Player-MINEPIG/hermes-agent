@@ -1,0 +1,9 @@
+name: remote_hermes
+version: 0.1.0
+description: "Call local Hermes API servers on other devices through Tailscale."
+author: Player-MINEPIG
+kind: backend
+provides_tools:
+  - remote_hermes_list
+  - remote_hermes_health
+  - remote_hermes_run
